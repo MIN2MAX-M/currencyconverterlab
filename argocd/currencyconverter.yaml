@@ -7,7 +7,7 @@ spec:
   project: default
   source:
     repoURL: 'git@github.com:MIN2MAX-M/currencyconverterlab.git'
-    targetRevision: HEAD
+    targetRevision: main
     path: k8s/overlays/production
   destination:
     server: 'https://kubernetes.default.svc'
