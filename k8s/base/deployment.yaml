@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
       - name: currency-converter
-        image: emmytech05/currencyconverter:1.0.0
+        image: emmytech05/currencyconverter:ea3af13
         ports:
         - containerPort: 5555
         env:
