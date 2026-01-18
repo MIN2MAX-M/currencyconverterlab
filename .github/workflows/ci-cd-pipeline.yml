@@ -2,13 +2,15 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
     tags:
-      - 'v*.*.*'
+      - "v*.*.*"
+
+permissions:
+  contents: write
 
 env:
-  DOCKER_IMAGE: afakharany/currencyconverter
+  DOCKER_IMAGE: emmytech05/currencyconverter
 
 jobs:
   test:
@@ -20,92 +22,82 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - run: |
+          python-version: "3.11"
+      - name: Install deps
+        run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - run: python -m unittest discover -s tests
+      - name: Run unit tests
+        run: python -m unittest discover -s tests
 
   build-and-push:
     needs: test
     runs-on: ubuntu-latest
     outputs:
-      sha: ${{ steps.short-sha.outputs.sha }} 
+      sha: ${{ steps.short_sha.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
+
       - name: Get short SHA
-        id: short-sha
-        run: echo "::set-output name=sha::$(git rev-parse --short=7 ${{ github.sha }})"
+        id: short_sha
+        run: echo "sha=$(git rev-parse --short=7 $GITHUB_SHA)" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare Docker Tags
-        id: docker-tags
+      - name: Prepare tags
+        id: prep
+        shell: bash
         run: |
-          COMMIT_SHA=${{ steps.short-sha.outputs.sha }}
-          echo "COMMIT_SHA_TAG=$COMMIT_SHA" >> $GITHUB_ENV
-          if [[ $GITHUB_REF == refs/tags/* ]]; then
-            VERSION_TAG=${GITHUB_REF/refs\/tags\//}
-            echo "VERSION_TAG=$VERSION_TAG" >> $GITHUB_ENV
-            TAGS="$VERSION_TAG,$COMMIT_SHA,latest"
-          else
-            TAGS="$COMMIT_SHA,latest"
+          SHA="${{ steps.short_sha.outputs.sha }}"
+          TAGS="${{ env.DOCKER_IMAGE }}:${SHA},${{ env.DOCKER_IMAGE }}:latest"
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            TAGS="${{ env.DOCKER_IMAGE }}:${VERSION},${{ env.DOCKER_IMAGE }}:${SHA},${{ env.DOCKER_IMAGE }}:latest"
           fi
-          echo "DOCKER_IMAGE_TAGS=$TAGS" >> $GITHUB_ENV
 
-      - name: Build and Push Docker image
-        run: |
-          DOCKER_IMAGE=${{ env.DOCKER_IMAGE }}
-          DOCKER_USERNAME=${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD=${{ secrets.DOCKER_PASSWORD }}
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
-          # Log in to Docker Hub
-          echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+      - uses: docker/setup-buildx-action@v3
 
-          # Build Docker image
-          docker build -t $DOCKER_IMAGE .
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
 
-          # Tag and Push Docker image for each determined tag
-          IFS=',' read -ra TAGS <<< "$DOCKER_IMAGE_TAGS"
-          for TAG in "${TAGS[@]}"; do
-            docker tag $DOCKER_IMAGE $DOCKER_IMAGE:$TAG
-            docker push $DOCKER_IMAGE:$TAG
-          done
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.prep.outputs.tags }}
+
   update-deployment:
     needs: build-and-push
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure Git
         run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Update Deployment Image
+      - name: Update Deployment image tag
+        shell: bash
         run: |
-          git pull --rebase origin main
-          IMAGE_TAG=${{ needs.build-and-push.outputs.sha }}
-          sed -i 's|image: '${{ env.DOCKER_IMAGE }}':.*|image: '${{ env.DOCKER_IMAGE }}':'"$IMAGE_TAG"'|' k8s/base/deployment.yaml
-          git add k8s/base/deployment.yaml
-          git commit -m "Update image version to $IMAGE_TAG"
+          IMAGE_TAG="${{ needs.build-and-push.outputs.sha }}"
+          FILE="k8s/base/deployment.yaml"
+
+          sed -i "s|image: *${DOCKER_IMAGE}.*|image: ${DOCKER_IMAGE}:${IMAGE_TAG}|g" "$FILE"
+
+          git add "$FILE"
+          if git diff --cached --quiet; then
+            echo "No change to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(ci): update image tag to ${IMAGE_TAG}"
           git push
-
-      - name: Install Argo CD CLI
-        run: |
-          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          chmod +x /usr/local/bin/argocd
-
-      - name: Login to Argo CD
-        run: |
-          argocd login $ARGOCD_SERVER --username admin --password $ARGOCD_AUTH_TOKEN
-        env:
-          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
-          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
-
-      - name: Sync Argo CD Application
-        run: |
-          argocd app sync $ARGOCD_APP_NAME
-        env:
-          ARGOCD_APP_NAME: currencyconverter-production
-
-
